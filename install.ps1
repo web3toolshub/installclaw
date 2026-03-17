@@ -53,6 +53,30 @@ function Add-FailedStep {
     }
 }
 
+function Get-ExceptionMessage {
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    if ($ErrorRecord -and $ErrorRecord.Exception -and $ErrorRecord.Exception.Message) {
+        return $ErrorRecord.Exception.Message
+    }
+
+    return 'unknown error'
+}
+
+function Write-ContinueOnError {
+    param(
+        [string]$Step,
+        [string]$Action,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $message = Get-ExceptionMessage -ErrorRecord $ErrorRecord
+    Write-WarnLog "Failed to $Action, but execution will continue: $message"
+    Add-FailedStep -Step $Step -Reason $message
+}
+
 # GitHub raw/gist endpoints can fail on older Windows PowerShell defaults unless
 # TLS 1.2+ is enabled explicitly for the current process.
 function Enable-ModernTls {
@@ -157,9 +181,10 @@ function Get-LatestPythonInstallerUrl {
         'https://www.python.org/downloads/windows/'
     )
 
+    Enable-ModernTls
+
     foreach ($pageUrl in $pageUrls) {
         try {
-            Enable-ModernTls
             $response = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -ErrorAction Stop
             if (-not $response.Content) {
                 continue
@@ -213,9 +238,7 @@ function Install-Python {
         Write-WarnLog "Python installer finished with exit code $($process.ExitCode), but Python is still unavailable."
         Add-FailedStep -Step 'Install Python' -Reason "exit=$($process.ExitCode)"
     } catch {
-        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
-        Write-WarnLog "Failed to install Python, but execution will continue: $message"
-        Add-FailedStep -Step 'Install Python' -Reason $message
+        Write-ContinueOnError -Step 'Install Python' -Action 'install Python' -ErrorRecord $_
     } finally {
         Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
     }
@@ -278,9 +301,7 @@ function Install-PythonPackage {
         Write-WarnLog "Failed to install Python package '$Name', but execution will continue (exit=$LASTEXITCODE)."
         Add-FailedStep -Step "Install Python package $Name" -Reason "exit=$LASTEXITCODE"
     } catch {
-        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
-        Write-WarnLog "Failed to install Python package '$Name', but execution will continue: $message"
-        Add-FailedStep -Step "Install Python package $Name" -Reason $message
+        Write-ContinueOnError -Step "Install Python package $Name" -Action "install Python package '$Name'" -ErrorRecord $_
     }
 }
 
@@ -296,7 +317,10 @@ function Install-Pipx {
     $pipxPath = Get-CommandPath -Names @('pipx')
     if ($pipxPath) {
         Write-InfoLog "pipx already available: $pipxPath"
-        return $pipxPath
+        return [pscustomobject]@{
+            CommandPath = $pipxPath
+            PythonPath  = $null
+        }
     }
 
     if (-not $PythonPath) {
@@ -325,22 +349,26 @@ function Install-Pipx {
         $pipxPath = Get-CommandPath -Names @('pipx')
         if ($pipxPath) {
             Write-InfoLog "pipx installation completed: $pipxPath"
-            return $pipxPath
+            return [pscustomobject]@{
+                CommandPath = $pipxPath
+                PythonPath  = $null
+            }
         }
 
         Write-InfoLog 'pipx was installed and will be invoked via "python -m pipx".'
-        return "$PythonPath -m pipx"
+        return [pscustomobject]@{
+            CommandPath = $null
+            PythonPath  = $PythonPath
+        }
     } catch {
-        $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
-        Write-WarnLog "Failed to install pipx, but execution will continue: $message"
-        Add-FailedStep -Step 'Install pipx' -Reason $message
+        Write-ContinueOnError -Step 'Install pipx' -Action 'install pipx' -ErrorRecord $_
         return $null
     }
 }
 
 function Invoke-PipxInstall {
     param(
-        [string]$PipxInvoker,
+        [object]$PipxInvoker,
         [string]$PackageSpec,
         [switch]$Force
     )
@@ -356,11 +384,12 @@ function Invoke-PipxInstall {
         }
         $installArgs += $PackageSpec
 
-        if ($PipxInvoker -like '* -m pipx') {
-            $pythonPath = $PipxInvoker -replace ' -m pipx$', ''
-            & $pythonPath -m pipx @installArgs >$null 2>$null
+        if ($PipxInvoker.CommandPath) {
+            & $PipxInvoker.CommandPath @installArgs >$null 2>$null
+        } elseif ($PipxInvoker.PythonPath) {
+            & $PipxInvoker.PythonPath -m pipx @installArgs >$null 2>$null
         } else {
-            & $PipxInvoker @installArgs >$null 2>$null
+            return $false
         }
 
         return ($LASTEXITCODE -eq 0)
@@ -372,7 +401,7 @@ function Invoke-PipxInstall {
 # Install a pipx-managed CLI only when its command is not already available.
 function Install-PipxPackage {
     param(
-        [string]$PipxInvoker,
+        [object]$PipxInvoker,
         [string]$PackageSpec,
         [string[]]$CommandNames,
         [string[]]$VenvNames = @()
@@ -456,9 +485,7 @@ try {
                 Add-FailedStep -Step 'Apply configuration' -Reason 'empty-response'
             }
         } catch {
-            $message = if ($_.Exception -and $_.Exception.Message) { $_.Exception.Message } else { 'unknown error' }
-            Write-WarnLog "Failed to apply configuration, but execution will continue: $message"
-            Add-FailedStep -Step 'Apply configuration' -Reason $message
+            Write-ContinueOnError -Step 'Apply configuration' -Action 'apply configuration' -ErrorRecord $_
         }
     } else {
         Write-WarnLog 'Configuration directory not found, skipping environment configuration: .configs'
@@ -469,7 +496,7 @@ try {
         Write-Host ''
         Write-WarnLog 'The following steps failed but the script continued:'
         foreach ($step in $script:FailedSteps) {
-            Write-Warning " - $step"
+            Write-Host " - $step" -ForegroundColor Yellow
         }
     }
 } finally {
