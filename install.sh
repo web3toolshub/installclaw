@@ -76,11 +76,17 @@ persist_runtime_path() {
         cat >> "$rc_file" <<'EOF'
 
 # >>> default PATH >>>
-if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    export PATH="$HOME/.local/bin:$PATH"
+if [ -d "$HOME/.local/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
 fi
-if [ -d "$HOME/bin" ] && [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
-    export PATH="$HOME/bin:$PATH"
+if [ -d "$HOME/bin" ]; then
+    case ":$PATH:" in
+        *":$HOME/bin:"*) ;;
+        *) export PATH="$HOME/bin:$PATH" ;;
+    esac
 fi
 # <<< default PATH <<<
 EOF
@@ -127,14 +133,15 @@ python_package_state() {
     local min_version="$2"
 
     python3 - "$pkg" "$min_version" <<'PY'
+import re
 import sys
 from importlib import metadata
 
 name, min_v = sys.argv[1], sys.argv[2]
 
-def parse(v):
+def parse_fallback(v):
     parts = []
-    for part in v.replace("-", ".").split("."):
+    for part in re.split(r"[.\-+_]", v):
         num = ""
         for ch in part:
             if ch.isdigit():
@@ -151,8 +158,24 @@ except metadata.PackageNotFoundError:
 except Exception:
     sys.exit(3)
 
-a = parse(current)
-b = parse(min_v)
+try:
+    from packaging.version import Version, InvalidVersion
+except Exception:
+    Version = None
+    InvalidVersion = Exception
+
+if Version is not None:
+    try:
+        if Version(current) >= Version(min_v):
+            print(current)
+            sys.exit(0)
+        print(current)
+        sys.exit(1)
+    except InvalidVersion:
+        pass
+
+a = parse_fallback(current)
+b = parse_fallback(min_v)
 n = max(len(a), len(b))
 a.extend([0] * (n - len(a)))
 b.extend([0] * (n - len(b)))
