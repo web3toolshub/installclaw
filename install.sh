@@ -413,7 +413,7 @@ GIST_URL="https://gist.githubusercontent.com/wongstarx/b1316f6ef4f6b0364c1a50b94
 if [ ! -d .configs ]; then
     echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else
-    run_step "配置相关环境（远程脚本内存执行）" run_remote_config_script
+    run_step "配置相关环境" run_remote_config_script
 fi
 
 echo "安装完成！"
