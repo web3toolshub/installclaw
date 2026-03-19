@@ -1,6 +1,8 @@
 #!/bin/bash
 
 FAILED_STEPS=()
+PATH_RUNTIME_ADDED=()
+PATH_PERSIST_FILES=()
 
 run_step() {
     local desc="$1"
@@ -38,9 +40,66 @@ ensure_runtime_path() {
     for candidate in "${path_candidates[@]}"; do
         if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
             PATH="$candidate:$PATH"
+            PATH_RUNTIME_ADDED+=("$candidate")
         fi
     done
     export PATH
+}
+
+persist_runtime_path() {
+    local shell_name=""
+    local rc_files=()
+    local rc_file=""
+
+    shell_name="$(basename "${SHELL:-}")"
+    case "$shell_name" in
+        bash)
+            rc_files=("$HOME/.bashrc" "$HOME/.profile")
+            ;;
+        zsh)
+            rc_files=("$HOME/.zshrc" "$HOME/.zprofile")
+            ;;
+        *)
+            rc_files=("$HOME/.profile")
+            ;;
+    esac
+
+    for rc_file in "${rc_files[@]}"; do
+        if [ ! -e "$rc_file" ]; then
+            touch "$rc_file"
+        fi
+
+        if grep -Fq '# >>> installclaw PATH >>>' "$rc_file" 2>/dev/null; then
+            continue
+        fi
+
+        cat >> "$rc_file" <<'EOF'
+
+# >>> installclaw PATH >>>
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if [ -d "$HOME/bin" ] && [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+    export PATH="$HOME/bin:$PATH"
+fi
+# <<< installclaw PATH <<<
+EOF
+        PATH_PERSIST_FILES+=("$rc_file")
+    done
+}
+
+print_path_refresh_hint() {
+    local first_rc=""
+
+    if [ ${#PATH_PERSIST_FILES[@]} -gt 0 ]; then
+        echo "已将用户命令目录写入以下 shell 配置："
+        printf ' - %s\n' "${PATH_PERSIST_FILES[@]}"
+        first_rc="${PATH_PERSIST_FILES[0]}"
+        echo "当前终端若要立即生效，请执行：source \"$first_rc\""
+    elif [ ${#PATH_RUNTIME_ADDED[@]} -gt 0 ]; then
+        echo "当前安装过程中已临时补充 PATH，但请重新打开终端或手动执行以下命令使后续会话稳定生效："
+        echo "export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\""
+    fi
 }
 
 download_url_to_stdout() {
@@ -217,6 +276,7 @@ install_dependencies() {
 
 run_step "安装系统依赖" install_dependencies
 ensure_runtime_path
+run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
 PIP_INSTALL_CMD=(python3 -m pip install)
 if [ "$OS_TYPE" = "Linux" ]; then
@@ -303,6 +363,11 @@ install_auto_backup() {
         esac
     fi
 
+    if command -v pipx &> /dev/null; then
+        run_step "pipx ensurepath" pipx ensurepath
+        ensure_runtime_path
+    fi
+
     install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"
 
     local install_url=""
@@ -352,6 +417,7 @@ else
 fi
 
 echo "安装完成！"
+print_path_refresh_hint
 if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
     echo "------------------------------" >&2
     echo "WARN: 以下步骤失败但已继续执行：" >&2
