@@ -69,20 +69,20 @@ persist_runtime_path() {
             touch "$rc_file"
         fi
 
-        if grep -Fq '# >>> installclaw PATH >>>' "$rc_file" 2>/dev/null; then
+        if grep -Fq '# >>> default PATH >>>' "$rc_file" 2>/dev/null; then
             continue
         fi
 
         cat >> "$rc_file" <<'EOF'
 
-# >>> installclaw PATH >>>
+# >>> default PATH >>>
 if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 if [ -d "$HOME/bin" ] && [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
     export PATH="$HOME/bin:$PATH"
 fi
-# <<< installclaw PATH <<<
+# <<< default PATH <<<
 EOF
         PATH_PERSIST_FILES+=("$rc_file")
     done
