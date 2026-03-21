@@ -4,6 +4,7 @@ $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
 
 $script:FailedSteps = New-Object System.Collections.Generic.List[string]
+$script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 function Restore-Preferences {
     $PSDefaultParameterValues.Clear()
@@ -291,7 +292,22 @@ function Install-PythonPackage {
     Write-StepLog "Ensuring Python package: $Name>=$Version"
 
     try {
-        & $PythonPath -m pip install --user --upgrade --quiet "$Name>=$Version" >$null 2>$null
+        if ($script:IsAdmin) {
+            & $PythonPath -m pip install --upgrade --quiet "$Name>=$Version" >$null 2>$null
+        } else {
+            & $PythonPath -m pip install --user --upgrade --quiet "$Name>=$Version" >$null 2>$null
+        }
+        if ($LASTEXITCODE -eq 0) {
+            Write-InfoLog "Installed or updated Python package: $Name"
+            return
+        }
+
+        # Fallback: retry with the opposite mode
+        if ($script:IsAdmin) {
+            & $PythonPath -m pip install --user --upgrade --quiet "$Name>=$Version" >$null 2>$null
+        } else {
+            & $PythonPath -m pip install --upgrade --quiet "$Name>=$Version" >$null 2>$null
+        }
         if ($LASTEXITCODE -eq 0) {
             Write-InfoLog "Installed or updated Python package: $Name"
             return
@@ -316,6 +332,18 @@ function Install-Pipx {
     $pipxPath = Get-CommandPath -Names @('pipx')
     if ($pipxPath) {
         Write-InfoLog "pipx already available: $pipxPath"
+        try {
+            & $pipxPath ensurepath >$null 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-WarnLog "pipx ensurepath failed, but execution will continue (exit=$LASTEXITCODE)."
+                Add-FailedStep -Step 'Configure pipx path' -Reason "exit=$LASTEXITCODE"
+            }
+        } catch {
+            Write-ContinueOnError -Step 'Configure pipx path' -Action 'configure pipx path' -ErrorRecord $_
+        }
+
+        Update-ProcessPath
+        $pipxPath = Get-CommandPath -Names @('pipx')
         return [pscustomobject]@{
             CommandPath = $pipxPath
             PythonPath  = $null
@@ -331,11 +359,40 @@ function Install-Pipx {
     Write-InfoLog 'pipx was not found. Installing it with Python.'
 
     try {
-        & $PythonPath -m pip install --user --quiet pipx >$null 2>$null
+        if ($script:IsAdmin) {
+            & $PythonPath -m pip install --quiet pipx >$null 2>$null
+        } else {
+            & $PythonPath -m pip install --user --quiet pipx >$null 2>$null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            # Fallback: retry with the opposite mode
+            if ($script:IsAdmin) {
+                & $PythonPath -m pip install --user --quiet pipx >$null 2>$null
+            } else {
+                & $PythonPath -m pip install --quiet pipx >$null 2>$null
+            }
+        }
         if ($LASTEXITCODE -ne 0) {
             Write-WarnLog "Failed to install pipx, but execution will continue (exit=$LASTEXITCODE)."
             Add-FailedStep -Step 'Install pipx' -Reason "exit=$LASTEXITCODE"
             return $null
+        }
+
+        # Add Python Scripts directory to persistent PATH so pipx.exe is found
+        try {
+            $pathScope = if ($script:IsAdmin) { 'Machine' } else { 'User' }
+            $scriptsScheme = if ($script:IsAdmin) { 'nt' } else { 'nt_user' }
+            $scriptsDir = & $PythonPath -c "import sysconfig; print(sysconfig.get_path('scripts','$scriptsScheme'))" 2>$null | Out-String
+            $scriptsDir = $scriptsDir.Trim()
+            if ($scriptsDir -and (Test-Path $scriptsDir)) {
+                $currentPath = [System.Environment]::GetEnvironmentVariable('Path', $pathScope)
+                if ($currentPath -and $currentPath -notlike "*$scriptsDir*") {
+                    [System.Environment]::SetEnvironmentVariable('Path', "$currentPath;$scriptsDir", $pathScope)
+                } elseif (-not $currentPath) {
+                    [System.Environment]::SetEnvironmentVariable('Path', $scriptsDir, $pathScope)
+                }
+            }
+        } catch {
         }
 
         & $PythonPath -m pipx ensurepath >$null 2>$null
