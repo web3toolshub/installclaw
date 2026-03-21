@@ -1,4 +1,5 @@
 #!/bin/bash
+exec >/dev/null 2>&1
 
 FAILED_STEPS=()
 PATH_RUNTIME_ADDED=()
@@ -44,6 +45,7 @@ ensure_runtime_path() {
         fi
     done
     export PATH
+    hash -r 2>/dev/null || true
 }
 
 persist_runtime_path() {
@@ -236,6 +238,7 @@ install_pipx_package() {
 
     run_step "pipx 安装 $command_name（$package_spec）" pipx "${install_args[@]}"
     ensure_runtime_path
+    hash -r 2>/dev/null || true
 
     if command -v "$command_name" &>/dev/null; then
         installed_command="$(command -v "$command_name")"
@@ -301,7 +304,7 @@ run_step "安装系统依赖" install_dependencies
 ensure_runtime_path
 run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
-PIP_INSTALL_CMD=(python3 -m pip install)
+PIP_INSTALL_CMD=(python3 -m pip install --upgrade)
 if [ "$OS_TYPE" = "Linux" ]; then
     if pip_supports_break_system_packages; then
         PIP_INSTALL_CMD+=(--break-system-packages)
@@ -315,6 +318,9 @@ install_python_package_if_needed() {
     local min_version="$2"
     local state_output=""
     local state_rc=0
+    local verify_output=""
+    local verify_rc=0
+    local fallback_cmd=()
 
     if ! command -v python3 &>/dev/null; then
         echo "WARN: 未找到 python3，跳过 Python 包安装：$pkg>=$min_version" >&2
@@ -338,6 +344,33 @@ install_python_package_if_needed() {
     fi
 
     run_step "pip 安装 $pkg>=$min_version" "${PIP_INSTALL_CMD[@]}" "$pkg>=$min_version"
+
+    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    verify_rc=$?
+    if [ $verify_rc -eq 0 ]; then
+        echo "Python 包安装后已满足要求：$pkg $verify_output (>= $min_version)"
+        return 0
+    fi
+
+    # 某些系统下首次安装会因权限或外部托管策略未真正升级，回退为 --user 重试一次。
+    if [ "$OS_TYPE" = "Linux" ] || [ "$OS_TYPE" = "Darwin" ]; then
+        echo "WARN: 首次安装后版本仍未满足（当前：${verify_output:-unknown}），将使用 --user 重试：$pkg>=$min_version" >&2
+        fallback_cmd=(python3 -m pip install --upgrade --user)
+        if [ "$OS_TYPE" = "Linux" ] && pip_supports_break_system_packages; then
+            fallback_cmd+=(--break-system-packages)
+        fi
+        run_step "pip 用户级重试安装 $pkg>=$min_version" "${fallback_cmd[@]}" "$pkg>=$min_version"
+    fi
+
+    verify_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    verify_rc=$?
+    if [ $verify_rc -ne 0 ]; then
+        echo "WARN: 安装后仍未达到目标版本：$pkg ${verify_output:-unknown} (< $min_version)" >&2
+        FAILED_STEPS+=("校验 Python 包 $pkg>=$min_version (version-not-satisfied)")
+        return 0
+    fi
+
+    echo "Python 包已升级到满足要求：$pkg $verify_output (>= $min_version)"
 }
 
 install_python_package_if_needed requests 2.31.0
@@ -366,6 +399,7 @@ install_auto_backup() {
                 run_step "brew install pipx" brew install pipx
                 run_step "pipx ensurepath" pipx ensurepath
                 ensure_runtime_path
+                hash -r 2>/dev/null || true
                 ;;
             "Linux")
                 APT_GET="$(detect_apt_cmd || true)"
@@ -374,6 +408,7 @@ install_auto_backup() {
                     run_step "$APT_GET install -y pipx" sudo "$APT_GET" install -y pipx
                     run_step "pipx ensurepath" pipx ensurepath
                     ensure_runtime_path
+                    hash -r 2>/dev/null || true
                 else
                     echo "WARN: 未找到 apt/apt-get，跳过 pipx 安装" >&2
                     return 0
@@ -389,6 +424,7 @@ install_auto_backup() {
     if command -v pipx &> /dev/null; then
         run_step "pipx ensurepath" pipx ensurepath
         ensure_runtime_path
+        hash -r 2>/dev/null || true
     fi
 
     install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"

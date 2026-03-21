@@ -1,8 +1,5 @@
 $originalPSDefaults = $PSDefaultParameterValues.Clone()
 
-$PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
-$PSDefaultParameterValues['*:WarningAction'] = 'SilentlyContinue'
-$PSDefaultParameterValues['*:InformationAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
 
@@ -19,25 +16,18 @@ function Write-StepLog {
     param(
         [string]$Message
     )
-
-    Write-Host ''
-    Write-Host "==> $Message"
 }
 
 function Write-InfoLog {
     param(
         [string]$Message
     )
-
-    Write-Host $Message
 }
 
 function Write-WarnLog {
     param(
         [string]$Message
     )
-
-    Write-Host "WARNING: $Message" -ForegroundColor Yellow
 }
 
 function Add-FailedStep {
@@ -175,7 +165,16 @@ function Get-PipxVenvPythonPath {
 
 # Scrape the latest 64-bit Python installer URL and fall back to a pinned build
 # if the download pages cannot be parsed.
+function Get-PythonInstallerArch {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -eq 'ARM64') {
+        return 'arm64'
+    }
+    return 'amd64'
+}
+
 function Get-LatestPythonInstallerUrl {
+    $installerArch = Get-PythonInstallerArch
     $pageUrls = @(
         'https://www.python.org/downloads/latest/',
         'https://www.python.org/downloads/windows/'
@@ -190,8 +189,8 @@ function Get-LatestPythonInstallerUrl {
                 continue
             }
 
-# Use a dedicated variable name to avoid clobbering automatic variable $matches.
-            $pythonMatches = [regex]::Matches($response.Content, '(https://www\.python\.org)?/ftp/python/[^"''<>\s]+/python-[0-9.]+-amd64\.exe')
+            # Use a dedicated variable name to avoid clobbering automatic variable $matches.
+            $pythonMatches = [regex]::Matches($response.Content, "(https://www\.python\.org)?/ftp/python/[^`"'<>\s]+/python-[0-9.]+-$installerArch\.exe")
             foreach ($match in $pythonMatches) {
                 $url = $match.Value
                 if ($url -notmatch '^https://') {
@@ -204,7 +203,7 @@ function Get-LatestPythonInstallerUrl {
         }
     }
 
-    return 'https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe'
+    return "https://www.python.org/ftp/python/3.13.3/python-3.13.3-$installerArch.exe"
 }
 
 # Make sure Python is available. If it is missing, download and install it
@@ -292,7 +291,7 @@ function Install-PythonPackage {
     Write-StepLog "Ensuring Python package: $Name>=$Version"
 
     try {
-        & $PythonPath -m pip install --user --quiet "$Name>=$Version" >$null 2>$null
+        & $PythonPath -m pip install --user --upgrade --quiet "$Name>=$Version" >$null 2>$null
         if ($LASTEXITCODE -eq 0) {
             Write-InfoLog "Installed or updated Python package: $Name"
             return
@@ -492,13 +491,6 @@ try {
     }
 
     Write-InfoLog 'Installation bootstrap completed.'
-    if ($script:FailedSteps.Count -gt 0) {
-        Write-Host ''
-        Write-WarnLog 'The following steps failed but the script continued:'
-        foreach ($step in $script:FailedSteps) {
-            Write-Host " - $step" -ForegroundColor Yellow
-        }
-    }
 } finally {
     Restore-Preferences
 }
